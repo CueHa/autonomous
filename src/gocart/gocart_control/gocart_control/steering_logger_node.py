@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import csv
 import math
-from pathlib import Path
+import os
+from typing import Optional
 
 import rclpy
-from rclpy.node import Node
 from ackermann_msgs.msg import AckermannDriveStamped
+from rclpy.node import Node
 
 
 class SteeringLoggerNode(Node):
@@ -17,45 +18,55 @@ class SteeringLoggerNode(Node):
         self.declare_parameter('use_header_stamp', True)
         self.declare_parameter('print_every_n', 20)
 
-        self.topic_name = self.get_parameter('topic_name').get_parameter_value().string_value
-        self.csv_path = self.get_parameter('csv_path').get_parameter_value().string_value
-        self.use_header_stamp = self.get_parameter('use_header_stamp').get_parameter_value().bool_value
-        self.print_every_n = self.get_parameter('print_every_n').get_parameter_value().integer_value
-
-        if self.print_every_n <= 0:
-            self.get_logger().warn('print_every_n must be > 0. Falling back to 20.')
-            self.print_every_n = 20
+        self.topic_name = self.get_parameter(
+            'topic_name').get_parameter_value().string_value
+        self.csv_path = self.get_parameter(
+            'csv_path').get_parameter_value().string_value
+        self.use_header_stamp = self.get_parameter(
+            'use_header_stamp').get_parameter_value().bool_value
+        self.print_every_n = max(1, self.get_parameter(
+            'print_every_n').get_parameter_value().integer_value)
 
         self.sample_index = 0
 
-        self.prev_time_sec = None
-        self.prev_theta = None
-        self.prev_dtheta_dt = None
+        self.last_valid_time_sec: Optional[float] = None
+        self.last_valid_theta: Optional[float] = None
+        self.last_valid_dtheta: float = math.nan
+        self.valid_derivative_sample_count = 0
 
-        self._open_csv()
+        self.csv_file, self.csv_writer = self._open_csv(self.csv_path)
 
         self.subscription = self.create_subscription(
             AckermannDriveStamped,
             self.topic_name,
-            self._callback,
+            self.cmd_vel_callback,
             10,
         )
 
         self.get_logger().info(
-            f'Steering logger started. topic={self.topic_name}, csv_path={self.csv_path}, '
-            f'use_header_stamp={self.use_header_stamp}, print_every_n={self.print_every_n}'
+            f'Logging steering from {self.topic_name} to {self.csv_path} '
+            f'(use_header_stamp={self.use_header_stamp}, print_every_n={self.print_every_n})'
         )
 
-    def _open_csv(self) -> None:
-        csv_file = Path(self.csv_path)
-        csv_file.parent.mkdir(parents=True, exist_ok=True)
+    def _open_csv(self, csv_path: str):
+        directory = os.path.dirname(csv_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
-        file_exists = csv_file.exists()
-        self.csv_handle = open(csv_file, 'a', newline='', encoding='utf-8')
-        self.csv_writer = csv.writer(self.csv_handle)
+        file_exists = os.path.exists(csv_path)
+        has_content = file_exists and os.path.getsize(csv_path) > 0
 
-        if (not file_exists) or csv_file.stat().st_size == 0:
-            self.csv_writer.writerow([
+        try:
+            csv_file = open(csv_path, 'a', newline='', encoding='utf-8')
+        except OSError as exc:
+            self.get_logger().error(
+                f'Failed to open CSV file at {csv_path}: {exc}')
+            raise
+
+        csv_writer = csv.writer(csv_file)
+
+        if not has_content:
+            csv_writer.writerow([
                 'sample_index',
                 'recv_time_sec',
                 'msg_time_sec',
@@ -68,85 +79,82 @@ class SteeringLoggerNode(Node):
                 'dtheta_dt',
                 'd2theta_dt2',
             ])
-            self.csv_handle.flush()
+            csv_file.flush()
 
-    def _stamp_to_sec(self, msg: AckermannDriveStamped) -> float:
-        return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        return csv_file, csv_writer
 
-    def _callback(self, msg: AckermannDriveStamped) -> None:
+    @staticmethod
+    def _stamp_to_sec(stamp) -> float:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def cmd_vel_callback(self, msg: AckermannDriveStamped) -> None:
         recv_time_sec = self.get_clock().now().nanoseconds * 1e-9
-        header_time_sec = self._stamp_to_sec(msg)
+        header_time_sec = self._stamp_to_sec(msg.header.stamp)
+        msg_time_sec = header_time_sec if self.use_header_stamp else recv_time_sec
 
-        if self.use_header_stamp:
-            msg_time_sec = header_time_sec
-        else:
-            msg_time_sec = recv_time_sec
-
-        steering_angle = float(msg.drive.steering_angle)
-        steering_angle_velocity_msg = float(msg.drive.steering_angle_velocity)
-        speed = float(msg.drive.speed)
-        acceleration = float(msg.drive.acceleration)
-        jerk = float(msg.drive.jerk)
+        theta = float(msg.drive.steering_angle)
 
         dt_sec = math.nan
         dtheta_dt = math.nan
         d2theta_dt2 = math.nan
 
-        if self.prev_time_sec is None:
-            self.prev_time_sec = msg_time_sec
-            self.prev_theta = steering_angle
+        if self.last_valid_time_sec is None:
+            self.last_valid_time_sec = msg_time_sec
+            self.last_valid_theta = theta
+            self.last_valid_dtheta = math.nan
+            self.valid_derivative_sample_count = 1
         else:
-            dt_sec = msg_time_sec - self.prev_time_sec
-
+            dt_sec = msg_time_sec - self.last_valid_time_sec
             if dt_sec > 0.0:
-                dtheta_dt = (steering_angle - self.prev_theta) / dt_sec
+                dtheta_dt = (theta - self.last_valid_theta) / dt_sec
+                if self.valid_derivative_sample_count >= 2 and math.isfinite(self.last_valid_dtheta):
+                    d2theta_dt2 = (dtheta_dt - self.last_valid_dtheta) / dt_sec
 
-                if self.prev_dtheta_dt is not None:
-                    d2theta_dt2 = (dtheta_dt - self.prev_dtheta_dt) / dt_sec
-
-                self.prev_time_sec = msg_time_sec
-                self.prev_theta = steering_angle
-                self.prev_dtheta_dt = dtheta_dt
+                self.last_valid_time_sec = msg_time_sec
+                self.last_valid_theta = theta
+                self.last_valid_dtheta = dtheta_dt
+                self.valid_derivative_sample_count += 1
 
         self.csv_writer.writerow([
             self.sample_index,
             recv_time_sec,
             msg_time_sec,
             dt_sec,
-            steering_angle,
-            steering_angle_velocity_msg,
-            speed,
-            acceleration,
-            jerk,
+            theta,
+            float(msg.drive.steering_angle_velocity),
+            float(msg.drive.speed),
+            float(msg.drive.acceleration),
+            float(msg.drive.jerk),
             dtheta_dt,
             d2theta_dt2,
         ])
-        self.csv_handle.flush()
+        self.csv_file.flush()
 
         self.sample_index += 1
 
         if self.sample_index % self.print_every_n == 0:
             self.get_logger().info(
-                f'logged {self.sample_index} samples. '
-                f'latest theta={steering_angle:.6f}, dtheta_dt={dtheta_dt}, d2theta_dt2={d2theta_dt2}'
+                f'samples={self.sample_index}, theta={theta:.6f}, dt={dt_sec}, '
+                f'dtheta_dt={dtheta_dt}, d2theta_dt2={d2theta_dt2}'
             )
 
-    def close(self) -> None:
-        if hasattr(self, 'csv_handle') and self.csv_handle:
-            self.csv_handle.flush()
-            self.csv_handle.close()
+    def destroy_node(self) -> bool:
+        try:
+            if hasattr(self, 'csv_file') and self.csv_file and not self.csv_file.closed:
+                self.csv_file.flush()
+                self.csv_file.close()
+        finally:
+            return super().destroy_node()
 
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SteeringLoggerNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('KeyboardInterrupt received. Shutting down steering_logger_node.')
+        node.get_logger().info('KeyboardInterrupt received, shutting down steering_logger_node.')
     finally:
-        node.close()
         node.destroy_node()
         rclpy.shutdown()
 

@@ -28,6 +28,7 @@ setup(
             'trajectory_follower = gocart_control.trajectory_follower_p_controller:main',
             'joystick_teleop = gocart_control.joystick_teleop:main',
             'mock_stimulus = gocart_control.mock_stimulus:main',
+            'steering_logger_node = gocart_control.steering_logger_node:main',
         ],
     },
 )
